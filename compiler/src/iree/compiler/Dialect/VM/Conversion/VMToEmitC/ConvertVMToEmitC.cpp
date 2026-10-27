@@ -2259,20 +2259,58 @@ private:
 
   // Returns the required alignment for a type (4 or 8 bytes).
   size_t getTypeAlignment(Type type) const {
-    // 64-bit types and refs require 8-byte alignment.
+    // 64-bit scalar types require 8-byte alignment.
     if (auto intType = dyn_cast<IntegerType>(type)) {
       return intType.getWidth() > 32 ? 8 : 4;
     }
     if (isa<Float64Type>(type)) {
       return 8;
     }
-    if (auto opaqueType = dyn_cast<emitc::OpaqueType>(type)) {
-      // iree_vm_ref_t contains pointers, so needs 8-byte alignment.
-      if (opaqueType.getValue() == "iree_vm_ref_t") {
-        return 8;
-      }
-    }
     return 4;
+  }
+
+  static bool isVmRefOpaqueType(Type type) {
+    auto opaqueType = dyn_cast<emitc::OpaqueType>(type);
+    return opaqueType && opaqueType.getValue() == "iree_vm_ref_t";
+  }
+
+  Value getVmRefAlignment(OpBuilder &builder, Location loc) const {
+    auto *ctx = builder.getContext();
+    Type hostSizeType = emitc::OpaqueType::get(ctx, "iree_host_size_t");
+    Type vmRefType = emitc::OpaqueType::get(ctx, "iree_vm_ref_t");
+    return emitc::CallOpaqueOp::create(
+               builder,
+               /*location=*/loc,
+               /*type=*/hostSizeType,
+               /*callee=*/"iree_alignof",
+               /*operands=*/ArrayRef<Value>{},
+               /*args=*/ArrayAttr::get(ctx, {TypeAttr::get(vmRefType)}))
+        .getResult(0);
+  }
+
+  Value alignToDynamic(OpBuilder &builder, Location loc, Value size,
+                       Value alignment) const {
+    auto *ctx = builder.getContext();
+    Type hostSizeType = emitc::OpaqueType::get(ctx, "iree_host_size_t");
+    return emitc::CallOpaqueOp::create(
+               builder,
+               /*location=*/loc,
+               /*type=*/hostSizeType,
+               /*callee=*/"iree_host_align",
+               /*operands=*/ArrayRef<Value>{size, alignment})
+        .getResult(0);
+  }
+
+  Value alignPtrDynamic(OpBuilder &builder, Location loc, Value ptr,
+                        Value alignment) const {
+    auto *ctx = builder.getContext();
+    Type uintptrType = emitc::OpaqueType::get(ctx, "uintptr_t");
+    Type bytePtrType = emitc::PointerType::get(builder.getIntegerType(8, false));
+    Value ptrAsInt =
+        emitc::CastOp::create(builder, loc, uintptrType, ptr).getResult();
+    Value aligned = alignToDynamic(builder, loc, ptrAsInt, alignment);
+    return emitc::CastOp::create(builder, loc, bytePtrType, aligned)
+        .getResult();
   }
 
   MaybeZeroValue buildSizeExpression(ArrayRef<Type> types, OpBuilder &builder,
@@ -2289,16 +2327,23 @@ private:
             .getResult();
     bool isZero = true;
     size_t maxAlignment = 4;
+    bool hasVmRefType = false;
     for (Type type : types) {
       Type valueType = typeConverter.convertTypeAsNonPointer(type);
 
-      // Align before adding this element if it requires 8-byte alignment.
-      size_t alignment = getTypeAlignment(valueType);
-      if (alignment > maxAlignment) {
-        maxAlignment = alignment;
-      }
-      if (alignment > 4) {
-        result = emitc_builders::alignTo(builder, loc, result, alignment);
+      // Keep ref alignment target-dependent (`iree_alignof(iree_vm_ref_t)`).
+      if (isVmRefOpaqueType(valueType)) {
+        result = alignToDynamic(builder, loc, result,
+                                getVmRefAlignment(builder, loc));
+        hasVmRefType = true;
+      } else {
+        size_t alignment = getTypeAlignment(valueType);
+        if (alignment > maxAlignment) {
+          maxAlignment = alignment;
+        }
+        if (alignment > 4) {
+          result = emitc_builders::alignTo(builder, loc, result, alignment);
+        }
       }
 
       Value size =
@@ -2314,8 +2359,14 @@ private:
 
     // Add trailing padding to match struct size (sizeof(struct) is always a
     // multiple of its alignment).
-    if (maxAlignment > 4 && !isZero) {
-      result = emitc_builders::alignTo(builder, loc, result, maxAlignment);
+    if (!isZero) {
+      if (maxAlignment > 4) {
+        result = emitc_builders::alignTo(builder, loc, result, maxAlignment);
+      }
+      if (hasVmRefType) {
+        result = alignToDynamic(builder, loc, result,
+                                getVmRefAlignment(builder, loc));
+      }
     }
 
     return MaybeZeroValue{result, isZero};
@@ -2448,9 +2499,15 @@ private:
 
       // Align pointer before accessing types that require 8-byte alignment.
       Type valueType = typeConverter.convertTypeAsNonPointer(argType);
-      size_t alignment = getTypeAlignment(valueType);
-      if (alignment > 4) {
-        uint8Ptr = emitc_builders::alignPtr(builder, loc, uint8Ptr, alignment);
+      if (isVmRefOpaqueType(valueType)) {
+        uint8Ptr = alignPtrDynamic(builder, loc, uint8Ptr,
+                                   getVmRefAlignment(builder, loc));
+      } else {
+        size_t alignment = getTypeAlignment(valueType);
+        if (alignment > 4) {
+          uint8Ptr =
+              emitc_builders::alignPtr(builder, loc, uint8Ptr, alignment);
+        }
       }
 
       if (argType == emitc::PointerType::get(
@@ -2543,9 +2600,15 @@ private:
       // Get the value type and compute alignment (must match packArgumentBuffer
       // exactly to ensure we're releasing the correct locations).
       Type valueType = typeConverter.convertTypeAsNonPointer(inputType);
-      size_t alignment = getTypeAlignment(valueType);
-      if (alignment > 4) {
-        uint8Ptr = emitc_builders::alignPtr(builder, loc, uint8Ptr, alignment);
+      if (isVmRefOpaqueType(valueType)) {
+        uint8Ptr = alignPtrDynamic(builder, loc, uint8Ptr,
+                                   getVmRefAlignment(builder, loc));
+      } else {
+        size_t alignment = getTypeAlignment(valueType);
+        if (alignment > 4) {
+          uint8Ptr =
+              emitc_builders::alignPtr(builder, loc, uint8Ptr, alignment);
+        }
       }
 
       // Release refs. If the callee took ownership and zeroed the ref,
@@ -2617,9 +2680,15 @@ private:
       }
 
       // Align pointer before accessing types that require 8-byte alignment.
-      size_t alignment = getTypeAlignment(valueType);
-      if (alignment > 4) {
-        uint8Ptr = emitc_builders::alignPtr(builder, loc, uint8Ptr, alignment);
+      if (isVmRefOpaqueType(valueType)) {
+        uint8Ptr = alignPtrDynamic(builder, loc, uint8Ptr,
+                                   getVmRefAlignment(builder, loc));
+      } else {
+        size_t alignment = getTypeAlignment(valueType);
+        if (alignment > 4) {
+          uint8Ptr =
+              emitc_builders::alignPtr(builder, loc, uint8Ptr, alignment);
+        }
       }
 
       if (argType == emitc::PointerType::get(
