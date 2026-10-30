@@ -2059,6 +2059,11 @@ private:
     bool isZero;
   };
 
+  struct VariadicSpanInfo {
+    size_t startIndex;
+    SmallVector<Type> elementTypes;
+  };
+
   LogicalResult createVariadicImportShims(IREE::VM::ImportOp &importOp,
                                           OpBuilder &builder) const {
     SetVector<const void *> arities;
@@ -2175,8 +2180,12 @@ private:
 
       builder.setInsertionPointToStart(block);
 
+      SmallVector<Type> inputTypes =
+          flattenInputTypes(importOp, segmentSizes, builder);
+      SmallVector<VariadicSpanInfo> variadicSpans =
+          getVariadicSpanInfos(importOp, segmentSizes);
       MaybeZeroValue argumentSize = buildSizeExpression(
-          flattenInputTypes(importOp, segmentSizes, builder), builder, loc);
+          inputTypes, builder, loc, variadicSpans);
       MaybeZeroValue resultSize =
           buildSizeExpression(importOp.getResultTypes(), builder, loc);
 
@@ -2192,9 +2201,8 @@ private:
         return importOp.emitError() << "failed to create call struct";
       }
 
-      if (failed(packArgumentBuffer(
-              flattenInputTypes(importOp, segmentSizes, builder), newFuncOp,
-              call.value(), builder, loc))) {
+      if (failed(packArgumentBuffer(inputTypes, variadicSpans, newFuncOp,
+                                    call.value(), builder, loc))) {
         return importOp.emitError() << "failed to pack argument struct";
       }
 
@@ -2208,9 +2216,8 @@ private:
       // Release refs in argument buffer after call returns. Refs that were
       // taken by the callee (via assign_ref+memset) will be null and release
       // will be a no-op.
-      if (failed(releaseArgumentBuffer(
-              flattenInputTypes(importOp, segmentSizes, builder), call.value(),
-              builder, loc))) {
+        if (failed(releaseArgumentBuffer(inputTypes, variadicSpans, call.value(),
+                         builder, loc))) {
         return importOp.emitError() << "failed to release argument buffer";
       }
 
@@ -2313,8 +2320,61 @@ private:
         .getResult();
   }
 
+  Value alignToSpanMaxAlignment(OpBuilder &builder, Location loc, Value size,
+                                ArrayRef<Type> elementTypes) const {
+    size_t staticMaxAlignment = 4;
+    bool hasVmRefType = false;
+    for (Type type : elementTypes) {
+      Type valueType = typeConverter.convertTypeAsNonPointer(type);
+      if (isVmRefOpaqueType(valueType)) {
+        hasVmRefType = true;
+      } else {
+        staticMaxAlignment =
+            std::max(staticMaxAlignment, getTypeAlignment(valueType));
+      }
+    }
+
+    if (staticMaxAlignment > 4) {
+      size = emitc_builders::alignTo(builder, loc, size, staticMaxAlignment);
+    }
+    if (hasVmRefType) {
+      size = alignToDynamic(builder, loc, size,
+                            getVmRefAlignment(builder, loc));
+    }
+    return size;
+  }
+
+  Value alignPtrToSpanMaxAlignment(OpBuilder &builder, Location loc, Value ptr,
+                                   ArrayRef<Type> elementTypes) const {
+    size_t staticMaxAlignment = 4;
+    bool hasVmRefType = false;
+    for (Type type : elementTypes) {
+      Type valueType = typeConverter.convertTypeAsNonPointer(type);
+      if (isVmRefOpaqueType(valueType)) {
+        hasVmRefType = true;
+      } else {
+        staticMaxAlignment =
+            std::max(staticMaxAlignment, getTypeAlignment(valueType));
+      }
+    }
+    if (staticMaxAlignment == 4 && !hasVmRefType) {
+      return ptr;
+    }
+
+    auto *ctx = builder.getContext();
+    Type uintptrType = emitc::OpaqueType::get(ctx, "uintptr_t");
+    Value ptrAsInt =
+        emitc::CastOp::create(builder, loc, uintptrType, ptr).getResult();
+    Value aligned =
+        alignToSpanMaxAlignment(builder, loc, ptrAsInt, elementTypes);
+    Type bytePtrType = emitc::PointerType::get(builder.getIntegerType(8, false));
+    return emitc::CastOp::create(builder, loc, bytePtrType, aligned).getResult();
+  }
+
   MaybeZeroValue buildSizeExpression(ArrayRef<Type> types, OpBuilder &builder,
-                                     Location loc) const {
+                                     Location loc,
+                                     ArrayRef<VariadicSpanInfo> variadicSpans =
+                                         {}) const {
     auto ctx = builder.getContext();
 
     Type hostSizeType = emitc::OpaqueType::get(ctx, "iree_host_size_t");
@@ -2328,7 +2388,28 @@ private:
     bool isZero = true;
     size_t maxAlignment = 4;
     bool hasVmRefType = false;
-    for (Type type : types) {
+    size_t spanIndex = 0;
+    for (size_t i = 0; i <= types.size(); i++) {
+      if (spanIndex < variadicSpans.size() &&
+          variadicSpans[spanIndex].startIndex == i) {
+        const auto &span = variadicSpans[spanIndex++];
+        for (Type type : span.elementTypes) {
+          Type valueType = typeConverter.convertTypeAsNonPointer(type);
+          if (isVmRefOpaqueType(valueType)) {
+            hasVmRefType = true;
+          } else {
+            maxAlignment =
+                std::max(maxAlignment, getTypeAlignment(valueType));
+          }
+        }
+        result = alignToSpanMaxAlignment(builder, loc, result,
+                                         span.elementTypes);
+      }
+      if (i == types.size()) {
+        break;
+      }
+
+      Type type = types[i];
       Type valueType = typeConverter.convertTypeAsNonPointer(type);
 
       // Keep ref alignment target-dependent (`iree_alignof(iree_vm_ref_t)`).
@@ -2465,6 +2546,7 @@ private:
   }
 
   LogicalResult packArgumentBuffer(ArrayRef<Type> inputTypes,
+                                   ArrayRef<VariadicSpanInfo> variadicSpans,
                                    mlir::emitc::FuncOp &funcOp,
                                    TypedValue<emitc::LValueType> call,
                                    OpBuilder &builder, Location loc) const {
@@ -2491,7 +2573,18 @@ private:
                                                  /*type=*/bytePtrType,
                                                  /*memberName=*/"data",
                                                  /*operand=*/arguments);
-    for (size_t i = 0; i < inputTypes.size(); i++) {
+    size_t spanIndex = 0;
+    for (size_t i = 0; i <= inputTypes.size(); i++) {
+      if (spanIndex < variadicSpans.size() &&
+          variadicSpans[spanIndex].startIndex == i) {
+        uint8Ptr = alignPtrToSpanMaxAlignment(
+            builder, loc, uint8Ptr, variadicSpans[spanIndex].elementTypes);
+        spanIndex++;
+      }
+      if (i == inputTypes.size()) {
+        break;
+      }
+
       BlockArgument arg = funcOp.getArgument(i + inputOffset);
 
       Type argType = arg.getType();
@@ -2560,6 +2653,7 @@ private:
   // Refs that were taken by the callee (via assign_ref+memset) will be null
   // and release will be a no-op.
   LogicalResult releaseArgumentBuffer(ArrayRef<Type> inputTypes,
+                                      ArrayRef<VariadicSpanInfo> variadicSpans,
                                       TypedValue<emitc::LValueType> call,
                                       OpBuilder &builder, Location loc) const {
     // Find the last ref type index. We only need to iterate up to and including
@@ -2594,7 +2688,15 @@ private:
                                                  /*operand=*/arguments);
 
     // Only iterate up to and including the last ref type.
+    size_t spanIndex = 0;
     for (size_t i = 0; i <= *lastRefIndex; i++) {
+      if (spanIndex < variadicSpans.size() &&
+          variadicSpans[spanIndex].startIndex == i) {
+        uint8Ptr = alignPtrToSpanMaxAlignment(
+            builder, loc, uint8Ptr, variadicSpans[spanIndex].elementTypes);
+        spanIndex++;
+      }
+
       Type inputType = inputTypes[i];
 
       // Get the value type and compute alignment (must match packArgumentBuffer
@@ -2808,6 +2910,37 @@ private:
       } else {
         expandType(type);
       }
+    }
+
+    return result;
+  }
+
+  SmallVector<VariadicSpanInfo>
+  getVariadicSpanInfos(IREE::VM::ImportOp importOp,
+                       DenseIntElementsAttr segmentSizes) const {
+    SmallVector<VariadicSpanInfo> result;
+    size_t flattenedIndex = 0;
+
+    for (size_t i = 0; i < importOp.getNumArguments(); i++) {
+      Type type = importOp.getFunctionType().getInput(i);
+      if (!importOp.isFuncArgumentVariadic(i)) {
+        flattenedIndex += isa<TupleType>(type) ? cast<TupleType>(type).size() : 1;
+        continue;
+      }
+
+      APInt segmentSize = *(segmentSizes.begin() + i);
+      int64_t count = segmentSize.getSExtValue();
+      assert(count >= 0);
+
+      VariadicSpanInfo span;
+      span.startIndex = ++flattenedIndex;
+      if (auto tupleType = dyn_cast<TupleType>(type)) {
+        span.elementTypes.append(tupleType.begin(), tupleType.end());
+      } else {
+        span.elementTypes.push_back(type);
+      }
+      result.push_back(std::move(span));
+      flattenedIndex += static_cast<size_t>(count) * result.back().elementTypes.size();
     }
 
     return result;
