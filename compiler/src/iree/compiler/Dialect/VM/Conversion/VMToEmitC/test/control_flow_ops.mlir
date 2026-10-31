@@ -738,6 +738,7 @@ vm.module @my_module {
 
   // Release refs in argument buffer after call returns.
   // CHECK: call_opaque "iree_vm_ref_release"
+  // CHECK-NEXT: call_opaque "iree_vm_ref_release"(%arg2)
 
   // Unpack the function results (with pointer alignment).
   // CHECK:      %[[RES_MEMBER:.+]] = "emitc.member"(%[[ARGSTRUCT]]) <{member = "results"}> : (!emitc.lvalue<!emitc.opaque<"iree_vm_function_call_t">>) -> !emitc.lvalue<!emitc.opaque<"iree_byte_span_t">>
@@ -929,7 +930,7 @@ vm.module @my_module {
     // CHECK-NEXT: %[[ARGREFPTR:.+]] = apply "&"(%[[ARGREF]]) : (!emitc.lvalue<!emitc.opaque<"iree_vm_ref_t">>) -> !emitc.ptr<!emitc.opaque<"iree_vm_ref_t">>
     // CHECK-NEXT: %[[ARGREFSIZE:.+]] = call_opaque "sizeof"() {args = [!emitc.opaque<"iree_vm_ref_t">]} : () -> !emitc.opaque<"iree_host_size_t">
     // CHECK-NEXT: call_opaque "memset"(%[[ARGREFPTR]], %[[ARGREFSIZE]]) {args = [0 : index, 0 : ui32, 1 : index]} : (!emitc.ptr<!emitc.opaque<"iree_vm_ref_t">>, !emitc.opaque<"iree_host_size_t">) -> ()
-    // CHECK-NEXT: call_opaque "iree_vm_ref_assign"(%arg3, %[[ARGREFPTR]]) : (!emitc.ptr<!emitc.opaque<"iree_vm_ref_t">>, !emitc.ptr<!emitc.opaque<"iree_vm_ref_t">>) -> ()
+    // CHECK-NEXT: call_opaque "iree_vm_ref_retain"(%arg3, %[[ARGREFPTR]]) : (!emitc.ptr<!emitc.opaque<"iree_vm_ref_t">>, !emitc.ptr<!emitc.opaque<"iree_vm_ref_t">>) -> ()
 
     // Allocate ref variable for result.
     // CHECK-NEXT: %[[RESREF:.+]] = "emitc.variable"() <{value = #emitc.opaque<"">}> : () -> !emitc.lvalue<!emitc.opaque<"iree_vm_ref_t">>

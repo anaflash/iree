@@ -2080,8 +2080,20 @@ private:
     return success();
   }
 
+  void releaseImportRefs(OpBuilder &builder, Location loc,
+                         mlir::emitc::FuncOp funcOp,
+                         ArrayRef<Type> inputTypes) const {
+    for (auto [index, type] : llvm::enumerate(inputTypes)) {
+      if (isa<IREE::VM::RefType>(type)) {
+        emitc_builders::ireeVmRefRelease(builder, loc,
+                                        funcOp.getArgument(index + 2));
+      }
+    }
+  }
+
   void failIfImportUnresolved(OpBuilder &builder, Location location,
-                              TypedValue<emitc::LValueType> import) const {
+                              TypedValue<emitc::LValueType> import,
+                              ArrayRef<Type> inputTypes) const {
     auto *ctx = builder.getContext();
     Type boolType = builder.getIntegerType(1);
 
@@ -2115,7 +2127,7 @@ private:
 
       mlir::emitc::FuncOp funcOp =
           cast<mlir::emitc::FuncOp>(failureBlock->getParentOp());
-      releaseRefs(builder, location, funcOp, typeConverter.analysis);
+        releaseImportRefs(builder, location, funcOp, inputTypes);
 
       auto statusOp = emitc::CallOpaqueOp::create(
           builder,
@@ -2192,7 +2204,7 @@ private:
       const int importArgIndex = 1;
       const BlockArgument importArg = newFuncOp.getArgument(importArgIndex);
       auto importArgLValue = emitc_builders::asLValue(builder, loc, importArg);
-      failIfImportUnresolved(builder, loc, importArgLValue);
+      failIfImportUnresolved(builder, loc, importArgLValue, inputTypes);
 
       auto call = buildIreeVmFunctionCallStruct(importArg, argumentSize,
                                                 resultSize, builder, loc);
@@ -2208,18 +2220,19 @@ private:
 
       const BlockArgument stackArg =
           newFuncOp.getArgument(CCONV_ARGUMENT_STACK);
-      if (failed(createCall(call.value(), importArgLValue, stackArg, builder,
-                            loc))) {
+      if (failed(createCall(call.value(), importArgLValue, stackArg, inputTypes,
+                            variadicSpans, builder, loc))) {
         return importOp.emitError() << "failed to create call";
       }
 
       // Release refs in argument buffer after call returns. Refs that were
       // taken by the callee (via assign_ref+memset) will be null and release
       // will be a no-op.
-        if (failed(releaseArgumentBuffer(inputTypes, variadicSpans, call.value(),
-                         builder, loc))) {
+      if (failed(releaseArgumentBuffer(inputTypes, variadicSpans, call.value(),
+                                       builder, loc))) {
         return importOp.emitError() << "failed to release argument buffer";
       }
+      releaseImportRefs(builder, loc, newFuncOp, inputTypes);
 
       if (failed(unpackResultBuffer(importOp.getResultTypes(), newFuncOp,
                                     call.value(), builder, loc))) {
@@ -2833,6 +2846,8 @@ private:
 
   LogicalResult createCall(TypedValue<emitc::LValueType> call,
                            TypedValue<emitc::LValueType> import, Value stack,
+                           ArrayRef<Type> inputTypes,
+                           ArrayRef<VariadicSpanInfo> variadicSpans,
                            OpBuilder &builder, Location loc) const {
     auto ctx = builder.getContext();
 
@@ -2862,18 +2877,28 @@ private:
     if (!beginCall) {
       return failure();
     }
-    returnIfError(
+    LogicalResult cleanupResult = success();
+    auto cleanupOnError = [&](emitc::CallOpaqueOp &callOp) {
+      cleanupResult = releaseArgumentBuffer(inputTypes, variadicSpans, call,
+                         builder, loc);
+      auto funcOp = cast<mlir::emitc::FuncOp>(
+        builder.getInsertionBlock()->getParentOp());
+      releaseImportRefs(builder, loc, funcOp, inputTypes);
+      mlir::emitc::ReturnOp::create(builder, loc, callOp.getResult(0));
+    };
+    failableCall(
         /*rewriter=*/builder,
         /*location=*/loc,
+      /*type=*/emitc::OpaqueType::get(ctx, "iree_status_t"),
         /*callee=*/"EMITC_CALL_INDIRECT",
         /*args=*/{},
         /*operands=*/
         ArrayRef<Value>{emitc_builders::asRValue(builder, loc, beginCall),
                         emitc_builders::asRValue(builder, loc, importModule),
                         stack, emitc_builders::asRValue(builder, loc, call)},
-        typeConverter.analysis);
+                cleanupOnError, /*negateCondition=*/true);
 
-    return success();
+              return cleanupResult;
   }
 
   // A span count of -1 means a non variadic call
@@ -3195,7 +3220,7 @@ class CallOpConversion : public EmitCConversionPattern<OpTy> {
         builder,
         /*location=*/loc,
         /*type=*/TypeRange{},
-        /*callee=*/"iree_vm_ref_assign",
+        /*callee=*/"iree_vm_ref_retain",
         /*operands=*/ArrayRef<Value>{operandRef, refPtr});
 
     return refPtr;
@@ -3259,7 +3284,7 @@ class CallYieldableOpConversion
         auto [ref, refPtr] = emitc_builders::allocZeroInitializedVar(
             rewriter, loc, emitc::OpaqueType::get(ctx, "iree_vm_ref_t"));
         emitc::CallOpaqueOp::create(rewriter, loc, TypeRange{},
-                                    "iree_vm_ref_assign",
+                      "iree_vm_ref_retain",
                                     ArrayRef<Value>{operandRef, refPtr});
         updatedOperands.push_back(refPtr);
       }
@@ -3433,7 +3458,7 @@ class CallVariadicYieldableOpConversion
               auto [ref, refPtr] = emitc_builders::allocZeroInitializedVar(
                   rewriter, loc, emitc::OpaqueType::get(ctx, "iree_vm_ref_t"));
               emitc::CallOpaqueOp::create(rewriter, loc, TypeRange{},
-                                          "iree_vm_ref_assign",
+                              "iree_vm_ref_retain",
                                           ArrayRef<Value>{operandRef, refPtr});
               updatedOperands.push_back(refPtr);
             }
@@ -3448,7 +3473,7 @@ class CallVariadicYieldableOpConversion
           auto [ref, refPtr] = emitc_builders::allocZeroInitializedVar(
               rewriter, loc, emitc::OpaqueType::get(ctx, "iree_vm_ref_t"));
           emitc::CallOpaqueOp::create(rewriter, loc, TypeRange{},
-                                      "iree_vm_ref_assign",
+                          "iree_vm_ref_retain",
                                       ArrayRef<Value>{operandRef, refPtr});
           updatedOperands.push_back(refPtr);
         }
